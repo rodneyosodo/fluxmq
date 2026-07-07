@@ -318,17 +318,34 @@ func (b *Broker) handleDisconnect(s *session.Session, graceful bool) {
 	}
 
 	if s.CleanStart && s.ExpiryInterval == 0 {
-		b.sessionLocks.Lock(s.ID)
-		b.destroySessionLocked(context.Background(), s) //nolint:errcheck // best-effort session cleanup for clean-start sessions
-		b.sessionLocks.Unlock(s.ID)
+		// Defer cleanup to avoid deadlock: handleDisconnect is called from
+		// ConnectWithOptions (inside CreateSession) which already holds
+		// sessionLocks. Running destroySessionLocked here would re-acquire
+		// the same lock.
+		go func(s *session.Session) {
+			b.sessionLocks.Lock(s.ID)
+			defer b.sessionLocks.Unlock(s.ID)
 
-		// Release ownership for clean sessions
-		if b.cluster != nil {
-			ctx := context.Background()
-			if err := b.cluster.ReleaseSession(ctx, s.ID); err != nil {
-				b.logError("cluster_release_session", err, slog.String("client_id", s.ID))
+			// Only clean up if this session is still the one tracked in sessionsMap.
+			// handleDisconnect can be called from CreateSession's destroySessionLocked,
+			// which may have already created and stored a replacement session by the
+			// time this goroutine runs.
+			if current := b.sessionsMap.Get(s.ID); current != s {
+				return
 			}
-		}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := b.destroySessionLocked(ctx, s); err != nil {
+				b.logError("cleanup_session", err, slog.String("client_id", s.ID))
+			}
+
+			if b.cluster != nil {
+				if err := b.cluster.ReleaseSession(ctx, s.ID); err != nil {
+					b.logError("cluster_release_session", err, slog.String("client_id", s.ID))
+				}
+			}
+		}(s)
 	}
 	// For persistent sessions, DON'T release ownership immediately
 	// Keep ownership so messages can still be routed to this node
